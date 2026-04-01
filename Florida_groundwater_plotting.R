@@ -4,7 +4,7 @@ library(dplyr)
 library(sf)
 library(zoo)
 getwd()
-setwd("D:/395")
+setwd("D:/395") 
 
 #######################
 ### Reading in data ###
@@ -262,8 +262,30 @@ comparison <- function(gw_data, swot_data, mapping_table) {
     gw <- gw_data %>% filter(SiteNo == current_site) %>% mutate(Time = ymd_hms(Time))
     swot <- swot_data %>% filter(lake_id == current_lake, quality_f <= 1) %>% mutate(time_str = ymd_hms(time_str))
     
-    if(nrow(gw) <= 10 | nrow(swot) <= 10) next
+    # --- NEW: Trim SWOT with a 100-day Buffer ---
+    if(nrow(gw) > 0) {
+      gw_range <- range(gw$Time, na.rm = TRUE)
+      
+      # Expand the window by 100 days on both ends
+      buffer_start <- gw_range[1] - days(100)
+      buffer_end   <- gw_range[2] + days(100)
+      
+      swot <- swot %>% 
+        filter(time_str >= buffer_start & time_str <= buffer_end)
+    }
+
+    # --- NEW: Tukey Filter (IQR) Outlier Removal ---
+    if(nrow(swot) > 5){
+      q1 <- quantile(swot$wse, 0.25, na.rm = TRUE)
+      q3 <- quantile(swot$wse, 0.75, na.rm = TRUE)
+      iqr <- q3 - q1
+      swot <- swot %>% 
+        filter(wse >= (q1 - 1.5 * iqr) & wse <= (q3 + 1.5 * iqr))
+    }
+    ###############################################################
     
+    if(nrow(gw) <= 10 | nrow(swot) <= 10) next
+
     gw$m <- gw[[level_col]] / 3.281
     gw$norm <- gw$m - mean(gw$m, na.rm = TRUE)
     swot$norm <- swot$wse - mean(swot$wse)
@@ -350,20 +372,129 @@ sjrwmdtable <- comparison(SJRWMD_data, swot, con_sjrwmd)
 names(usgstable) <- c("Agency", "Groundwater Site ID", "SWOT Lake ID", "Lag (days)", "Correlation r", "Distance (m)", "Lake Soil", "Groundwater Soil")
 names(sjrwmdtable) <- c("Agency", "Groundwater Site ID", "SWOT Lake ID", "Lag (days)", "Correlation r", "Distance (m)", "Lake Soil", "Groundwater Soil")
 
+final_combined_table <- rbind(usgstable, sjrwmdtable)
+table_print <- final_combined_table
 
+# Convert numeric columns to character before writing
+table_print$`Groundwater Site ID` <- format(table_print$`Groundwater Site ID`, scientific = FALSE, trim = TRUE) 
+
+write.csv(table_print, file = "swot_vs_gw_table.csv", row.names = FALSE)
 ###############################################################################################################
-# Statistics Function for Tables Created From Comparison Function #
-###################################################################
-calculated_stats <- function(table){
-  gw_soil <- table[, 8]
-  lake_soil <- table[, 7]
-  dist <- table[, 6]
-  r <- table[, 5]
-  lag <- table[, 4]
-  
-  #Do boxplot based on soil types (can aggregate sandy beachy with sandy)
-  #Regular soils, limestone, and peat 
-  #Scatter plot of correlation r and distance m
-  #
 
-}
+
+######################################################
+# Boxplotting Soil types and r lag correlation values#
+######################################################
+
+# 1. Create the Soil_Group column
+# We are grouping everything that isn't Peat or Limestone into "Regular Soil"
+final_combined_table <- final_combined_table %>%
+  mutate(Soil_Group = case_when(
+    `Groundwater Soil` == "LIMESTONE" ~ "Limestone",
+    `Groundwater Soil` == "PEAT"      ~ "Peat",
+    TRUE                              ~ "Sand, Silt, Clay" 
+  ))
+
+# 2. Generate the Boxplot
+
+ggplot(final_combined_table, aes(x = Soil_Group, y = `Correlation r`, fill = Soil_Group)) +
+  # Add the threshold lines FIRST so they sit behind the boxes
+  geom_hline(yintercept = c(0.7, -0.7), 
+             linetype = "dotted", 
+             color = "red3", 
+             linewidth = 0.5) +
+  
+  # Add a subtle zero line for reference
+  geom_hline(yintercept = 0, color = "gray60", size = 0.5) +
+  
+  geom_boxplot(alpha = 0.75, outlier.shape = NA, width = 0.6) + 
+  
+  geom_jitter(width = 0.15, alpha = 0.35, size = 1.5) +
+  
+  scale_y_continuous(limits = c(-1, 1), breaks = seq(-1, 1, 0.5)) +
+  
+  # Custom Colors
+  scale_fill_manual(values = c("Limestone" = "#56B4E9", 
+                               "Peat"      = "#a11111", 
+                               "Sand, Silt, Clay" = "#F5F5a9")) +
+  
+  labs(
+    title = "Lag Correlation By Soil Category",
+    subtitle = "Dotted Lines indicate a strong correlation of |r| > 0.7",
+    x = NULL,
+    y = "Correlation Coefficient (r)"
+  ) +
+  
+  theme_minimal() +
+  theme(
+    legend.position = "none", # Hide legend since X-axis labels handle it
+    axis.text.x = element_text(face = "bold", size = 11),
+    panel.grid.minor = element_blank()
+  )
+
+############################
+# Generate the Scatter Plot#
+############################
+
+# p values calculated by soil group 
+stats_labels <- final_combined_table %>%
+  group_by(Soil_Group) %>%
+  filter(n() > 2) %>% # Need at least 3 points for a trend line/p-value
+  group_modify(~ {
+    fit <- cor.test(.x$`Distance (m)`, .x$`Correlation r`)
+    data.frame(
+      p_label = paste0("p = ", format.sep = "", round(fit$p.value, 3)),
+      r_label = paste0("r = ", round(fit$estimate, 2))
+    )})
+
+# 2. Manually define your legend labels with the specific p-values you provided
+# We use \n to create the line break for the "stacked" look
+custom_labels <- c(
+  "Limestone"        = "Limestone\n(p = 0.342)",
+  "Peat"             = "Peat\n(p = 0.104)",
+  "Sand, Silt, Clay" = "Sand, Silt, Clay\n(p = 0.01)"
+)
+
+ggplot(final_combined_table, aes(x = `Distance (m)`, y = `Correlation r`, fill = Soil_Group)) +
+  
+  # Add the threshold lines
+  geom_hline(yintercept = c(0.7, -0.7), linetype = "dotted", color = "red", linewidth = 0.8) +
+  geom_hline(yintercept = 0, color = "gray60", size = 0.5) +
+  
+  # Optional: Add a trend line to see the 'Distance Decay'
+  geom_smooth(method = "lm", se = FALSE, linewidth = 0.75, linetype = "dashed", aes(color = Soil_Group)) +
+  
+  # Add the points
+  geom_point(aes(fill = Soil_Group),   
+             shape = 21,               
+             color = "black",          
+             size = 3,               
+             stroke = 1,               
+             alpha = 0.7) +
+  
+  # Formatting
+  scale_x_continuous(expand = expansion(mult = c(0.05, 0.1)))+ # Adds 10% extra space to the right 
+  scale_y_continuous(limits = c(-1, 1), breaks = seq(-1, 1, 0.2)) +
+  scale_fill_manual(values = c("Limestone" = "#56B4E9", 
+                                "Peat"      = "#a11111", 
+                                "Sand, Silt, Clay" = "#F5F5a9"), 
+                    labels = custom_labels) +
+  scale_color_manual(values = c("Limestone" = "#56aaee", 
+                               "Peat"      = "#a33333", 
+                               "Sand, Silt, Clay" = "#bfbf61"),
+                     labels = custom_labels) +
+  
+  labs(
+    title = "Correlation vs. Distance",
+    subtitle = "Separate trend lines and p-values shown for each geological group",
+    x = "Distance (meters)",
+    y = "Correlation Coefficient (r)",
+    fill = NULL,
+    color = NULL,
+  ) +
+  
+  theme_minimal() +
+  theme(
+    legend.position = "bottom",
+    panel.grid.minor = element_blank()
+  )

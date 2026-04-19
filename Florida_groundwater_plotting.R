@@ -3,20 +3,23 @@ library(lubridate)
 library(dplyr)
 library(sf)
 library(zoo)
-getwd()
-setwd("D:/395") 
+#getwd() #current working directory
+#setwd() #set working directory file path to folder with all files
 
 #######################
 ### Reading in data ###
 #######################
 
 #groundwater levels:
-usgs_data <- read.csv("water_levels/WATERLEVEL_USGS_24_26.csv", colClasses = c("SiteNo" = "character"))
-SJRWMD_data <- read.csv("water_levels/WATERLEVEL_SJRWMD_24_26.csv", colClasses = c("SiteNo" = "character"))
+usgs_data <- read.csv("WATERLEVEL_USGS_24_26.csv", colClasses = c("SiteNo" = "character"))
+SJRWMD_data <- read.csv("WATERLEVEL_SJRWMD_24_26.csv", colClasses = c("SiteNo" = "character"))
 
 #combining lake ids to groundwater ids
 all_gws <- read.csv("all_sites_withlakeids_1000m4th.csv")
-connected_ids <- all_gws[c("noSiteNo", "lake_id", "AgencyCd", "distance", "HorzDatum", "geologyCAT", "lkgeologyCAT")]
+connected_ids <- all_gws[c("noSiteNo", "lake_id", "AgencyCd", "distance", "HorzDatum", "geologyCAT", "lkgeologyCAT", "WellDepth", "AquiferTyp")]
+# All well depths are in feet # Aquifer type is either confined our unconfined
+connected_ids$WellDepth_m <- connected_ids$WellDepth / 3.281 #converting to meters
+
 
 #filtering by agency
 con_usgs <- connected_ids%>%
@@ -28,13 +31,13 @@ con_sjrwmd <- connected_ids %>%
   filter(AgencyCd == "SJRWMD") 
 
 #SWOT DATA
-swot <- read.csv("water_levels/SWOT_levels.csv")
+swot <- read.csv("SWOT_levels.csv")
 
 ##########################################################################
 #Testing of one gw site and lake to then implement in function below
 # 282202081384601   7320211482
 # Groundwater site 142m away
-
+##########################################################################
 #####################
 #### Data Setup #####
 #####################
@@ -59,6 +62,7 @@ swot_73202 <- swot %>%
 gw_28171$norm <- (gw_28171$m - mean(gw_28171$m, na.rm = TRUE))
 swot_73202$norm <- (swot_73202$wse - mean(swot_73202$wse))
 
+error_m <- 0.1 #meters
 ###################################
 ### cross correlation lag times ###
 ###################################
@@ -120,6 +124,12 @@ ggplot(ccf_df, aes(x = lag, y = acf)) +
 ###################
 
 ggplot() + 
+  geom_ribbon(data = swot_73202, 
+              aes(x = time_str, 
+                  ymin = norm - error_m, 
+                  ymax = norm + error_m), 
+              color = "gray",
+              alpha = 0.2) + # Very light transparency
   geom_line(data = gw_28171, 
             aes(x=Time, y = norm),
             color = "steelblue", linewidth = 1) +
@@ -134,7 +144,7 @@ ggplot() +
   scale_x_datetime(date_breaks = "3 month", 
                    date_labels = "%b") +
   labs(
-    title = "Groundwater Levels at Lake Oliver \nUSGS Site 282202081384601 \nSWOT ID: 7320211482",
+    title = paste("Groundwater Levels at Lake Oliver \nUSGS Site 282202081384601"),
     x = "",
     y = "Water Level Normalized (m)") +
   theme_minimal()
@@ -202,7 +212,7 @@ ggplot() +
              aes(x = PlotTime, y = norm, fill = "SWOT"), 
              color = "black", size = 2, shape = 21, stroke = 0.5) +
   
-  # THE KEY: This creates side-by-side plots with locked axes
+  #creates side-by-side plots with locked axes
   facet_wrap(~Type) + 
   
   # Aesthetics and Labels
@@ -235,13 +245,12 @@ ggplot() +
 #`#groundwater data converted to meters
 # #Normalizing both by subtracting the mean of each
 
-#Checks to see if more than 5 data points for both swot and gw sites 
+#Checks to see if more than 10 data points for both swot and gw sites 
 #If true goes into plotting that gw site vs swot passes of related lake
 
 #######################################################################
 comparison <- function(gw_data, swot_data, mapping_table) {
-  ## add outlier deteciton (Tukey filter) to get rid of a couple of SWOT points to get rid 
-  ## could do manually 
+
   results_list <- list()
   agency <- gw_data$AgencyCd[1]
   
@@ -258,15 +267,15 @@ comparison <- function(gw_data, swot_data, mapping_table) {
     Lake_Geology <- mapping_table$lkgeologyCAT[i]
     Groundwater_Geology <- mapping_table$geologyCAT[i]
     
-    # 1. Filter and Process
+    # Filter data
     gw <- gw_data %>% filter(SiteNo == current_site) %>% mutate(Time = ymd_hms(Time))
     swot <- swot_data %>% filter(lake_id == current_lake, quality_f <= 1) %>% mutate(time_str = ymd_hms(time_str))
     
-    # --- NEW: Trim SWOT with a 100-day Buffer ---
+    # Trim SWOT with a 100-day Buffer
     if(nrow(gw) > 0) {
       gw_range <- range(gw$Time, na.rm = TRUE)
       
-      # Expand the window by 100 days on both ends
+      # Expands the window by 100 days on both ends
       buffer_start <- gw_range[1] - days(100)
       buffer_end   <- gw_range[2] + days(100)
       
@@ -274,7 +283,7 @@ comparison <- function(gw_data, swot_data, mapping_table) {
         filter(time_str >= buffer_start & time_str <= buffer_end)
     }
 
-    # --- NEW: Tukey Filter (IQR) Outlier Removal ---
+    # Tukey Filter (IQR) Outlier Removal
     if(nrow(swot) > 5){
       q1 <- quantile(swot$wse, 0.25, na.rm = TRUE)
       q3 <- quantile(swot$wse, 0.75, na.rm = TRUE)
@@ -303,7 +312,7 @@ comparison <- function(gw_data, swot_data, mapping_table) {
              gw_interp = na.approx(gw_norm, na.rm = FALSE)) %>%
       filter(!is.na(swot_interp), !is.na(gw_interp))
     
-    # --- SAFETY CHECK: Do we have overlapping data? ---
+    # SAFETY CHECK
     if (nrow(combined_ts) < 2) {
       message(paste("Skipping Site:", current_site, "- No temporal overlap between GW and SWOT."))
       next
@@ -313,30 +322,41 @@ comparison <- function(gw_data, swot_data, mapping_table) {
     max_lag <- ccf_df[which.max(abs(ccf_df$acf)), ]
     lag_val <- max_lag$lag
     
-    # --- PLOT A: LAG CORRELATION COEFFICIENTS ---
+    # PLOT A: LAG CORRELATION COEFFICIENTS
     p_corr <- ggplot(ccf_df, aes(x = lag, y = acf)) +
-      geom_col(aes(fill = (lag == lag_val))) + # Highlight the best lag in a different color
-      scale_fill_manual(values = c("steelblue", "orange"), guide = "none") +
-      # Locking the Y-axis from -1 to 1
+
+      geom_hline(yintercept = 0, color = "grey70") +
+      
+      # vertical lines
+      geom_segment(aes(x = lag, xend = lag, y = 0, yend = acf, color = (lag == lag_val)), 
+                   linewidth = 0.6) + # Adjust linewidth to your liking
+      
+      # a small dot at the top of each line for visibility
+      geom_point(aes(color = (lag == lag_val)), size = 1) +
+      
+      scale_color_manual(values = c("steelblue", "orange"), guide = "none") +
+      
+      # Locks the Y-axis from -1 to 1
       scale_y_continuous(limits = c(-1, 1), breaks = seq(-1, 1, 0.5)) +
-      scale_x_continuous() +
-      labs(title = paste0("Lag Correlation Analysis\n",agency," Site ID: ", current_site, "\nLake SWOT ID: ", current_lake),
+      scale_x_continuous(breaks = seq(-100, 100, 20)) + # Explicit breaks help readability
+      
+      labs(title = paste0("Lag Correlation Analysis: SWOT to Groundwater\n", agency, " Site ID: ", current_site),
            subtitle = paste("Highest correlation (r =", round(max_lag$acf, 2), ") at", lag_val, "days"),
            x = "Lag (Days)", y = "Correlation Coefficient") +
       theme_minimal()
     
     print(p_corr)
     
-    # --- PLOT B: FACETED COMPARISON ---
+    # PLOT B: COMPARISON
     swot_long <- bind_rows(
       swot %>% mutate(PlotTime = time_str, Type = "Original (Unadjusted)"),
-      swot %>% mutate(PlotTime = time_str + days(lag_val), Type = paste("Adjusted (Lag:", lag_val, "Days)"))
+      swot %>% mutate(PlotTime = time_str + days(lag_val), Type = paste("Adjusted SWOT Lagged by:", lag_val, "Days"))
     )
     
     p_comp <- ggplot() +
-      geom_line(data = gw, aes(x = Time, y = norm, color = "Groundwater"), linewidth = 0.8) +
-      geom_line(data = swot_long, aes(x = PlotTime, y = norm, color = "SWOT"), linewidth = 0.8) +
-      geom_point(data = swot_long, aes(x = PlotTime, y = norm, fill = "SWOT"), shape = 21, size = 1.8, stroke = 0.5) +
+      geom_line(data = gw, aes(x = Time, y = norm, color = "Groundwater"), linewidth = 1) +
+      geom_line(data = swot_long, aes(x = PlotTime, y = norm, color = "SWOT"), linewidth = 0.5) +
+      geom_point(data = swot_long, aes(x = PlotTime, y = norm, fill = "SWOT"), shape = 21, size = 1.25, stroke = 0.5) +
       facet_wrap(~Type) +
       scale_color_manual(values = c("Groundwater" = "steelblue", "SWOT" = "red2"), breaks = "Groundwater") +
       scale_fill_manual(values = c("SWOT" = "red2")) +
@@ -349,8 +369,16 @@ comparison <- function(gw_data, swot_data, mapping_table) {
             strip.text = element_text(face = "bold"))
     
     print(p_comp)
+
+    # Saves to folder
+    #ggsave(paste0("Corr_Site_", current_site, "_Lake_", current_lake, ".png"), 
+    #       plot = p_corr, width = 10, height = 6, dpi = 300)
     
-    # 3. Store Data for the Final Table
+    # Saves to folder
+    #ggsave(paste0("Comp_Site_", current_site, "_Lake_", current_lake, ".png"), 
+    #       plot = p_comp, width = 10, height = 6, dpi = 300)
+    
+    # Stores Data for the Final Table
     results_list[[length(results_list) + 1]] <- data.frame(
       Ag = agency,
       Site = current_site, 
@@ -375,47 +403,43 @@ names(sjrwmdtable) <- c("Agency", "Groundwater Site ID", "SWOT Lake ID", "Lag (d
 final_combined_table <- rbind(usgstable, sjrwmdtable)
 table_print <- final_combined_table
 
-# Convert numeric columns to character before writing
+# Converts numeric columns to character before writing
 table_print$`Groundwater Site ID` <- format(table_print$`Groundwater Site ID`, scientific = FALSE, trim = TRUE) 
 
-write.csv(table_print, file = "swot_vs_gw_table.csv", row.names = FALSE)
+write.csv(table_print, file = 'swot_vs_gw_tab.csv')
 ###############################################################################################################
 
 
 ######################################################
 # Boxplotting Soil types and r lag correlation values#
 ######################################################
-
-# 1. Create the Soil_Group column
-# We are grouping everything that isn't Peat or Limestone into "Regular Soil"
 final_combined_table <- final_combined_table %>%
   mutate(Soil_Group = case_when(
     `Groundwater Soil` == "LIMESTONE" ~ "Limestone",
-    `Groundwater Soil` == "PEAT"      ~ "Peat",
-    TRUE                              ~ "Sand, Silt, Clay" 
+    `Groundwater Soil` == "PEAT" ~ "Peat",
+    TRUE ~ "Sand, Silt, Clay"
   ))
 
-# 2. Generate the Boxplot
 
 ggplot(final_combined_table, aes(x = Soil_Group, y = `Correlation r`, fill = Soil_Group)) +
-  # Add the threshold lines FIRST so they sit behind the boxes
-  geom_hline(yintercept = c(0.7, -0.7), 
-             linetype = "dotted", 
-             color = "red3", 
+  # threshold lines
+  geom_hline(yintercept = c(0.7, -0.7),
+             linetype = "dotted",
+             color = "red3",
              linewidth = 0.5) +
   
-  # Add a subtle zero line for reference
+  # zero line
   geom_hline(yintercept = 0, color = "gray60", size = 0.5) +
   
-  geom_boxplot(alpha = 0.75, outlier.shape = NA, width = 0.6) + 
+  geom_boxplot(alpha = 0.75, outlier.shape = NA, width = 0.6) +
   
   geom_jitter(width = 0.15, alpha = 0.35, size = 1.5) +
   
   scale_y_continuous(limits = c(-1, 1), breaks = seq(-1, 1, 0.5)) +
   
-  # Custom Colors
-  scale_fill_manual(values = c("Limestone" = "#56B4E9", 
-                               "Peat"      = "#a11111", 
+  # boxplots colors
+  scale_fill_manual(values = c("Limestone" = "#56B4E9",
+                               "Peat" = "#a11111",
                                "Sand, Silt, Clay" = "#F5F5a9")) +
   
   labs(
@@ -430,7 +454,8 @@ ggplot(final_combined_table, aes(x = Soil_Group, y = `Correlation r`, fill = Soi
     legend.position = "none", # Hide legend since X-axis labels handle it
     axis.text.x = element_text(face = "bold", size = 11),
     panel.grid.minor = element_blank()
-  )
+  )                   
+
 
 ############################
 # Generate the Scatter Plot#
@@ -447,8 +472,8 @@ stats_labels <- final_combined_table %>%
       r_label = paste0("r = ", round(fit$estimate, 2))
     )})
 
-# 2. Manually define your legend labels with the specific p-values you provided
-# We use \n to create the line break for the "stacked" look
+
+# p value labels
 custom_labels <- c(
   "Limestone"        = "Limestone\n(p = 0.342)",
   "Peat"             = "Peat\n(p = 0.104)",
@@ -457,14 +482,14 @@ custom_labels <- c(
 
 ggplot(final_combined_table, aes(x = `Distance (m)`, y = `Correlation r`, fill = Soil_Group)) +
   
-  # Add the threshold lines
+  # Threshold lines
   geom_hline(yintercept = c(0.7, -0.7), linetype = "dotted", color = "red", linewidth = 0.8) +
   geom_hline(yintercept = 0, color = "gray60", size = 0.5) +
   
-  # Optional: Add a trend line to see the 'Distance Decay'
+  # Trend line 
   geom_smooth(method = "lm", se = FALSE, linewidth = 0.75, linetype = "dashed", aes(color = Soil_Group)) +
   
-  # Add the points
+  # Points
   geom_point(aes(fill = Soil_Group),   
              shape = 21,               
              color = "black",          
@@ -498,3 +523,14 @@ ggplot(final_combined_table, aes(x = `Distance (m)`, y = `Correlation r`, fill =
     legend.position = "bottom",
     panel.grid.minor = element_blank()
   )
+
+
+
+#### For cross-correlation a continuous/regular temporal grid was used. 
+#### Linear interpolation of the SWOT data was used to create a daily time series, 
+#### which allows the R ccf() function algorithm to test for lags at a 1-day resolution. 
+#### The alternative was to go down to the resolution of SWOT data appearances however there
+#### is such a low sampling size at *random intervals* and the resolution would need be changed
+#### for every site this seemed like the better option. 
+#### The linear interpolation is often used for matching hydraulic responses
+#### between groundwater and surface water. 
